@@ -1,0 +1,20 @@
+# Environment variables and API secrets
+.env
+client_secrets.json
+token.json
+
+# Database and runtime logs
+*.db
+*.sqlite3
+
+# Python bytecode and cache
+__pycache__/
+*.pyc
+
+# Local media storage
+videos/
+temp_videos/
+
+# System files
+.DS_Store
+Thumbs.db

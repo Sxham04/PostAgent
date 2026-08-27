@@ -1,22 +1,27 @@
-import time
+import os
 from pathlib import Path
+import time
 import boto3
 from botocore.exceptions import NoCredentialsError
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import requests
-
 from config import (
     AWS_ACCESS_KEY_ID,
     AWS_REGION,
     AWS_SECRET_ACCESS_KEY,
+    BASE_DIR,
     INSTAGRAM_ACCESS_TOKEN,
     INSTAGRAM_USER_ID,
     S3_BUCKET_NAME,
     YOUTUBE_CLIENT_SECRETS_FILE,
     YOUTUBE_SCOPES,
 )
+
+TOKEN_FILE = BASE_DIR / "token.json"
 
 # ---------------------------------------------------------------------------
 # Storage Helper: AWS S3
@@ -99,7 +104,10 @@ def upload_instagram_reel(video_path: Path, caption: str) -> str:
         time.sleep(10)
         status_res = requests.get(
             status_url,
-            params={"fields": "status_code", "access_token": INSTAGRAM_ACCESS_TOKEN},
+            params={
+                "fields": "status_code",
+                "access_token": INSTAGRAM_ACCESS_TOKEN,
+            },
         ).json()
         status_code = status_res.get("status_code")
 
@@ -136,12 +144,30 @@ def upload_instagram_reel(video_path: Path, caption: str) -> str:
 
 
 def get_youtube_service():
-    """Authenticate and return an authorized YouTube API service object."""
-    flow = InstalledAppFlow.from_client_secrets_file(
-        YOUTUBE_CLIENT_SECRETS_FILE, scopes=YOUTUBE_SCOPES
-    )
-    credentials = flow.run_local_server(port=0)
-    return build("youtube", "v3", credentials=credentials)
+    """Authenticate and return an authorized YouTube API service object with token caching."""
+    creds = None
+
+    # Load existing token if available
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(
+            str(TOKEN_FILE), YOUTUBE_SCOPES
+        )
+
+    # Refresh or create credentials if invalid or missing
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                YOUTUBE_CLIENT_SECRETS_FILE, scopes=YOUTUBE_SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        # Save credentials for future headless runs
+        with open(TOKEN_FILE, "w") as token:
+            token.write(creds.to_json())
+
+    return build("youtube", "v3", credentials=creds)
 
 
 def upload_youtube_short(
