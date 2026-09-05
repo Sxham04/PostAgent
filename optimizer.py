@@ -1,138 +1,103 @@
-from datetime import datetime
-import random
-import requests
-from config import (
-    DEFAULT_POST_HOUR,
-    EXPLORATION_RATE,
-    INSTAGRAM_ACCESS_TOKEN,
-)
-from database import get_connection, get_slot_performance_averages, save_analytics
+import sqlite3
+from typing import List, Tuple
+from config import BASE_DIR
+from database import get_connection, update_video_metrics
 from uploader import get_youtube_service
 
-# Metric Collectors
-
-def fetch_instagram_metrics(instagram_media_id: str) -> dict:
-    """Fetch engagement numbers for a published Instagram Reel."""
-    if not instagram_media_id or not INSTAGRAM_ACCESS_TOKEN:
-        return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
-
-    url = f"https://graph.facebook.com/v19.0/{instagram_media_id}/insights"
-    params = {
-        "metric": "plays,likes,comments,shares",
-        "access_token": INSTAGRAM_ACCESS_TOKEN,
-    }
-
-    try:
-        res = requests.get(url, params=params).json()
-        data = res.get("data", [])
-        metrics = {item["name"]: item["values"][0]["value"] for item in data}
-        return {
-            "views": metrics.get("plays", 0),
-            "likes": metrics.get("likes", 0),
-            "comments": metrics.get("comments", 0),
-            "shares": metrics.get("shares", 0),
-        }
-    except Exception as e:
-        print(f"Warning: Could not fetch Instagram metrics: {e}")
-        return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+DEFAULT_EXPLORATION_SLOTS = [10, 14, 18, 22]
 
 
-def fetch_youtube_metrics(youtube_video_id: str) -> dict:
-    """Fetch view, like, and comment counts for a YouTube Short."""
-    if not youtube_video_id:
-        return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+def sync_published_video_metrics() -> None:
+    """Fetch latest view, like, and comment stats from YouTube API for published videos."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT youtube_id FROM videos 
+        WHERE status = 'published' AND youtube_id IS NOT NULL
+        """
+    )
+    video_rows = cursor.fetchall()
+    conn.close()
 
-    try:
-        youtube = get_youtube_service()
-        req = youtube.videos().list(part="statistics", id=youtube_video_id)
-        res = req.execute()
+    if not video_rows:
+        return
 
-        items = res.get("items", [])
-        if not items:
-            return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+    youtube = get_youtube_service()
+    video_ids = [row["youtube_id"] for row in video_rows]
 
-        stats = items[0]["statistics"]
-        return {
-            "views": int(stats.get("viewCount", 0)),
-            "likes": int(stats.get("likeCount", 0)),
-            "comments": int(stats.get("commentCount", 0)),
-            "shares": 0,  # YouTube Data API v3 does not expose share counts directly
-        }
-    except Exception as e:
-        print(f"Warning: Could not fetch YouTube metrics: {e}")
-        return {"views": 0, "likes": 0, "comments": 0, "shares": 0}
+    # Process in chunks of 50 (YouTube API maximum per request)
+    chunk_size = 50
+    for i in range(0, len(video_ids), chunk_size):
+        chunk = video_ids[i : i + chunk_size]
+        try:
+            response = (
+                youtube.videos()
+                .list(part="statistics", id=",".join(chunk))
+                .execute()
+            )
+
+            for item in response.get("items", []):
+                yid = item["id"]
+                stats = item.get("statistics", {})
+                views = int(stats.get("viewCount", 0))
+                likes = int(stats.get("likeCount", 0))
+                comments = int(stats.get("commentCount", 0))
+                update_video_metrics(
+                    youtube_id=yid, views=views, likes=likes, comments=comments
+                )
+
+            print(
+                f"[Optimizer] Synced analytics for {len(response.get('items', []))} videos."
+            )
+        except Exception as e:
+            print(f"[Optimizer] Metric sync failed: {e}")
 
 
-def sync_published_video_metrics():
-    """Scan database for published videos and refresh analytics scores."""
+def get_top_performing_slots(top_n: int = 4) -> List[int]:
+    """
+    Analyze past performance to find the best upload hours.
+    Falls back to DEFAULT_EXPLORATION_SLOTS if less than 10 data points exist.
+    """
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT id, published_time, youtube_id, instagram_id
+            SELECT 
+                publish_hour,
+                COUNT(*) as sample_count,
+                AVG(engagement_score) as avg_score
             FROM videos
-            WHERE status = 'published'
-        """
+            WHERE status = 'published' AND publish_hour IS NOT NULL
+            GROUP BY publish_hour
+            HAVING sample_count >= 2
+            ORDER BY avg_score DESC
+            LIMIT ?
+            """,
+            (top_n,),
         )
-        videos = cursor.fetchall()
+        results = cursor.fetchall()
 
-    for vid in videos:
-        if not vid["published_time"]:
-            continue
+    if len(results) < top_n:
+        return DEFAULT_EXPLORATION_SLOTS
 
-        pub_dt = datetime.fromisoformat(vid["published_time"])
-        day_of_week = pub_dt.weekday()
-        hour = pub_dt.hour
+    return [row["publish_hour"] for row in results]
 
-        # Sync Instagram metrics if available
-        if vid["instagram_id"]:
-            ig_data = fetch_instagram_metrics(vid["instagram_id"])
-            save_analytics(
-                video_id=vid["id"],
-                platform="instagram",
-                day_of_week=day_of_week,
-                hour=hour,
-                views=ig_data["views"],
-                likes=ig_data["likes"],
-                comments=ig_data["comments"],
-                shares=ig_data["shares"],
-                retention_rate=0.0,
-            )
 
-        # Sync YouTube metrics if available
-        if vid["youtube_id"]:
-            yt_data = fetch_youtube_metrics(vid["youtube_id"])
-            save_analytics(
-                video_id=vid["id"],
-                platform="youtube",
-                day_of_week=day_of_week,
-                hour=hour,
-                views=yt_data["views"],
-                likes=yt_data["likes"],
-                comments=yt_data["comments"],
-                shares=yt_data["shares"],
-                retention_rate=0.0,
-            )
-
-# Timing Strategy (Epsilon-Greedy Slot Selector)
-
-def get_optimal_upload_slot(platform: str) -> tuple[int, int]:
-    """
-    Return (day_of_week, hour) to publish next.
-    Uses epsilon-greedy exploration to discover peak engagement times.
-    """
-    # Explore: Pick a random hour between 09:00 and 22:00
-    if random.random() < EXPLORATION_RATE:
-        random_day = random.randint(0, 6)
-        random_hour = random.randint(9, 22)
-        return random_day, random_hour
-
-    # Exploit: Find the historical slot with the highest average engagement score
-    slots = get_slot_performance_averages(platform)
-    if not slots:
-        # Default fallback if no data exists yet
-        today = datetime.now().weekday()
-        return today, DEFAULT_POST_HOUR
-
-    best_slot = slots[0]  # Ordered DESC by avg_score in database query
-    return int(best_slot["post_day_of_week"]), int(best_slot["post_hour"])
+def get_slot_summary() -> List[Tuple[int, int, float]]:
+    """Return raw statistics (hour, uploads_count, avg_score) for CLI review."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT 
+                publish_hour,
+                COUNT(*) as count,
+                ROUND(AVG(engagement_score), 2) as avg_score
+            FROM videos
+            WHERE status = 'published' AND publish_hour IS NOT NULL
+            GROUP BY publish_hour
+            ORDER BY avg_score DESC
+            """
+        )
+        return cursor.fetchall()

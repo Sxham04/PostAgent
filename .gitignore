@@ -2,6 +2,7 @@
 .env
 client_secrets.json
 token.json
+instagram_session.json
 
 # Database and runtime logs
 *.db
@@ -14,6 +15,10 @@ __pycache__/
 # Local media storage
 videos/
 temp_videos/
+videos/pending/*
+videos/published/*
+!videos/pending/.gitkeep
+!videos/published/.gitkeep
 
 # System files
 .DS_Store

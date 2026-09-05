@@ -2,36 +2,24 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Base directory paths
+# Base project directory
 BASE_DIR = Path(__file__).resolve().parent
-VIDEOS_DIR = BASE_DIR / "videos"
-PENDING_DIR = VIDEOS_DIR / "pending"
-PUBLISHED_DIR = VIDEOS_DIR / "published"
-DATABASE_PATH = BASE_DIR / "data.db"
 
-# Create directories if they do not exist
-PENDING_DIR.mkdir(parents=True, exist_ok=True)
-PUBLISHED_DIR.mkdir(parents=True, exist_ok=True)
+# Load environment variables from .env
+load_dotenv(BASE_DIR / ".env")
 
-# Instagram API credentials
-INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID", "")
-INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
+# Instagram Credentials
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "og_clips04")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 
-# YouTube API credentials
-YOUTUBE_CLIENT_SECRETS_FILE = os.getenv(
-    "YOUTUBE_CLIENT_SECRETS_FILE", str(BASE_DIR / "client_secrets.json")
-)
+# YouTube Credentials & Scopes
+YOUTUBE_CLIENT_SECRETS_FILE = BASE_DIR / "client_secrets.json"
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
-# S3 / Public storage (Required for Instagram Reel upload)
-S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+DEFAULT_INSTAGRAM_CAPTION = (
+    "今晚,V走进人群,欣赏了Vogue World: Hollywood的现场表演。"
+    "以独特时尚造型而闻名的他,这次依旧保持一贯的高级感,展现出 effortless 的魅力。\n\n"
+    "#clips #funnyclips #twitchclips #streamer #fyp"
+)
 
-# Optimizer settings
-DEFAULT_POST_HOUR = int(os.getenv("DEFAULT_POST_HOUR", "18"))
-EXPLORATION_RATE = float(os.getenv("EXPLORATION_RATE", "0.20"))
+DEFAULT_YOUTUBE_DESCRIPTION = "#Shorts #Gaming #Highlights #Viral"

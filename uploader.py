@@ -1,141 +1,71 @@
 import os
 from pathlib import Path
-import time
-import boto3
-from botocore.exceptions import NoCredentialsError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import requests
+from instagrapi import Client
+from instagrapi.exceptions import LoginRequired
+
 from config import (
-    AWS_ACCESS_KEY_ID,
-    AWS_REGION,
-    AWS_SECRET_ACCESS_KEY,
     BASE_DIR,
-    INSTAGRAM_ACCESS_TOKEN,
-    INSTAGRAM_USER_ID,
-    S3_BUCKET_NAME,
+    DEFAULT_INSTAGRAM_CAPTION,
+    DEFAULT_YOUTUBE_DESCRIPTION,
+    INSTAGRAM_PASSWORD,
+    INSTAGRAM_USERNAME,
     YOUTUBE_CLIENT_SECRETS_FILE,
     YOUTUBE_SCOPES,
 )
 
-TOKEN_FILE = BASE_DIR / "token.json"
-
-# ---------------------------------------------------------------------------
-# Storage Helper: AWS S3
-# ---------------------------------------------------------------------------
-
-
-def upload_to_s3(file_path: Path) -> str:
-    """Upload a local video file to AWS S3 and return its public URL."""
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION,
-    )
-    object_name = f"temp_videos/{file_path.name}"
-
-    try:
-        s3_client.upload_file(
-            str(file_path),
-            S3_BUCKET_NAME,
-            object_name,
-            ExtraArgs={"ContentType": "video/mp4"},
-        )
-        url = f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{object_name}"
-        return url
-    except NoCredentialsError:
-        print("Error: AWS credentials not found.")
-        return ""
-
-
-def delete_from_s3(file_name: str) -> None:
-    """Delete a temporary video file from AWS S3 after publishing."""
-    s3_client = boto3.client(
-        "s3",
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name=AWS_REGION,
-    )
-    object_name = f"temp_videos/{file_name}"
-    try:
-        s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=object_name)
-    except Exception as e:
-        print(f"Warning: Could not delete temporary S3 file: {e}")
-
+YOUTUBE_TOKEN_FILE = BASE_DIR / "token.json"
+IG_SESSION_FILE = BASE_DIR / "instagram_session.json"
 
 # ---------------------------------------------------------------------------
 # Platform: Instagram Reels
 # ---------------------------------------------------------------------------
 
 
-def upload_instagram_reel(video_path: Path, caption: str) -> str:
-    """Upload a video as an Instagram Reel using Meta Graph API."""
-    # Step 1: Upload to S3 to get a public URL
-    public_url = upload_to_s3(video_path)
-    if not public_url:
-        raise RuntimeError("Failed to generate public video URL for Instagram.")
+def get_instagram_client() -> Client:
+    """Authenticate and return an instagrapi client session."""
+    if not INSTAGRAM_PASSWORD:
+        raise ValueError("INSTAGRAM_PASSWORD is not set in your .env file.")
 
-    base_api = "https://graph.facebook.com/v19.0"
+    cl = Client()
+    cl.delay_range = [1, 3]
 
-    # Step 2: Create media container
-    create_url = f"{base_api}/{INSTAGRAM_USER_ID}/media"
-    payload = {
-        "media_type": "REELS",
-        "video_url": public_url,
-        "caption": caption,
-        "share_to_feed": "true",
-        "access_token": INSTAGRAM_ACCESS_TOKEN,
-    }
-    res = requests.post(create_url, data=payload).json()
-    container_id = res.get("id")
+    if IG_SESSION_FILE.exists():
+        try:
+            cl.load_settings(IG_SESSION_FILE)
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            return cl
+        except (LoginRequired, Exception) as e:
+            print(f"Stored IG session expired or failed ({e}). Re-authenticating...")
 
-    if not container_id:
-        delete_from_s3(video_path.name)
-        raise RuntimeError(f"Instagram container creation failed: {res}")
+    cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+    cl.dump_settings(IG_SESSION_FILE)
+    return cl
 
-    # Step 3: Poll status until video processing finishes
-    status_url = f"{base_api}/{container_id}"
-    ready = False
-    for _ in range(15):  # Wait up to 150 seconds
-        time.sleep(10)
-        status_res = requests.get(
-            status_url,
-            params={
-                "fields": "status_code",
-                "access_token": INSTAGRAM_ACCESS_TOKEN,
-            },
-        ).json()
-        status_code = status_res.get("status_code")
 
-        if status_code == "FINISHED":
-            ready = True
-            break
-        elif status_code == "ERROR":
-            delete_from_s3(video_path.name)
-            raise RuntimeError(f"Instagram media processing error: {status_res}")
+def upload_instagram_reel(video_path: Path, caption: str = DEFAULT_INSTAGRAM_CAPTION) -> str:
+    """Upload a video directly as an Instagram Reel."""
+    print(f"Preparing Instagram Reel upload for: {video_path.name}")
+    cl = get_instagram_client()
 
-    if not ready:
-        delete_from_s3(video_path.name)
-        raise TimeoutError("Instagram media processing timed out.")
+    media = cl.clip_upload(
+        path=str(video_path),
+        caption=caption,
+    )
 
-    # Step 4: Publish container
-    publish_url = f"{base_api}/{INSTAGRAM_USER_ID}/media_publish"
-    publish_res = requests.post(
-        publish_url,
-        data={
-            "creation_id": container_id,
-            "access_token": INSTAGRAM_ACCESS_TOKEN,
-        },
-    ).json()
+    # Clean up thumbnail generated by instagrapi
+    for ext in [".mp4.jpg", ".jpg"]:
+        thumb = video_path.with_name(f"{video_path.name}{ext}")
+        if thumb.exists():
+            thumb.unlink()
 
-    # Step 5: Clean up temporary S3 file
-    delete_from_s3(video_path.name)
-
-    return publish_res.get("id", "")
+    media_id = str(media.pk)
+    print(f"Instagram Reel successfully posted! Media ID: {media_id}")
+    return media_id
 
 
 # ---------------------------------------------------------------------------
@@ -147,13 +77,11 @@ def get_youtube_service():
     """Authenticate and return an authorized YouTube API service object with token caching."""
     creds = None
 
-    # Load existing token if available
-    if os.path.exists(TOKEN_FILE):
+    if os.path.exists(YOUTUBE_TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(
-            str(TOKEN_FILE), YOUTUBE_SCOPES
+            str(YOUTUBE_TOKEN_FILE), YOUTUBE_SCOPES
         )
 
-    # Refresh or create credentials if invalid or missing
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -163,20 +91,18 @@ def get_youtube_service():
             )
             creds = flow.run_local_server(port=0)
 
-        # Save credentials for future headless runs
-        with open(TOKEN_FILE, "w") as token:
+        with open(YOUTUBE_TOKEN_FILE, "w") as token:
             token.write(creds.to_json())
 
     return build("youtube", "v3", credentials=creds)
 
 
 def upload_youtube_short(
-    video_path: Path, title: str, description: str = ""
+    video_path: Path, title: str, description: str = DEFAULT_YOUTUBE_DESCRIPTION
 ) -> str:
     """Upload a local video as a YouTube Short using YouTube Data API v3."""
     youtube = get_youtube_service()
 
-    # Ensure title contains #Shorts tag
     full_title = f"{title} #Shorts" if "#Shorts" not in title else title
     full_desc = f"{description}\n\n#Shorts"
 
@@ -184,7 +110,7 @@ def upload_youtube_short(
         "snippet": {
             "title": full_title,
             "description": full_desc,
-            "categoryId": "22",  # People & Blogs category
+            "categoryId": "22",
         },
         "status": {
             "privacyStatus": "public",
@@ -204,4 +130,6 @@ def upload_youtube_short(
     while response is None:
         _, response = request.next_chunk()
 
-    return response.get("id", "")
+    media_id = response.get("id", "")
+    print(f"YouTube Short successfully posted! Video ID: {media_id}")
+    return media_id

@@ -1,174 +1,130 @@
 from datetime import datetime
+from pathlib import Path
 import sqlite3
-from config import DATABASE_PATH
+from typing import Any, Dict, List, Optional
+from config import BASE_DIR
+
+DB_PATH = BASE_DIR / "data.db"
 
 
-def get_connection():
-    """Create and return a database connection."""
-    conn = sqlite3.connect(DATABASE_PATH)
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def initialize_database():
-    """Create the necessary database tables if they do not exist."""
+def initialize_database() -> None:
+    """Initialize database tables with hourly slot and engagement metric tracking."""
     with get_connection() as conn:
         cursor = conn.cursor()
-
-        # Table to track video files and upload status
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS videos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_name TEXT NOT NULL UNIQUE,
-                title TEXT NOT NULL,
-                description TEXT DEFAULT '',
-                status TEXT DEFAULT 'pending', -- pending, scheduled, published, failed
-                scheduled_time TEXT,
-                published_time TEXT,
+                file_name TEXT UNIQUE,
+                title TEXT,
+                description TEXT,
+                status TEXT DEFAULT 'pending',
                 youtube_id TEXT,
                 instagram_id TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                published_at TIMESTAMP,
+                publish_hour INTEGER,
+                publish_day INTEGER,
+                view_count INTEGER DEFAULT 0,
+                like_count INTEGER DEFAULT 0,
+                comment_count INTEGER DEFAULT 0,
+                engagement_score REAL DEFAULT 0.0
             )
-        """
-        )
-
-        # Table to track engagement metrics for the optimizer
-        cursor.execute(
             """
-            CREATE TABLE IF NOT EXISTS analytics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                video_id INTEGER NOT NULL,
-                platform TEXT NOT NULL, -- 'youtube' or 'instagram'
-                post_day_of_week INTEGER NOT NULL, -- 0 (Monday) to 6 (Sunday)
-                post_hour INTEGER NOT NULL, -- 0 to 23
-                views INTEGER DEFAULT 0,
-                likes INTEGER DEFAULT 0,
-                comments INTEGER DEFAULT 0,
-                shares INTEGER DEFAULT 0,
-                retention_rate REAL DEFAULT 0.0,
-                engagement_score REAL DEFAULT 0.0,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (video_id) REFERENCES videos (id)
-            )
-        """
         )
         conn.commit()
 
 
-def add_video(file_name: str, title: str, description: str = "") -> int:
-    """Insert a new video record into the queue."""
+def add_video(file_name: str, title: str, description: str = "") -> None:
+    """Register a new video into the queue if not already present."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
             INSERT OR IGNORE INTO videos (file_name, title, description, status)
             VALUES (?, ?, ?, 'pending')
-        """,
+            """,
             (file_name, title, description),
         )
         conn.commit()
-        return cursor.lastrowid
 
 
-def get_next_pending_video():
-    """Retrieve the oldest pending video from the database."""
+def get_next_pending_video() -> Optional[Dict[str, Any]]:
+    """Retrieve the oldest pending video from the queue."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT * FROM videos
-            WHERE status = 'pending'
-            ORDER BY id ASC
+            SELECT id, file_name, title, description 
+            FROM videos 
+            WHERE status = 'pending' 
+            ORDER BY id ASC 
             LIMIT 1
-        """
+            """
         )
-        return cursor.fetchone()
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
 
 def mark_video_published(
-    video_id: int, youtube_id: str = None, instagram_id: str = None
-):
-    """Update status to published with platform IDs and current timestamp."""
+    video_id: int, youtube_id: Optional[str], instagram_id: Optional[str]
+) -> None:
+    """Mark a video as published, saving timestamps and upload hour slots."""
+    now = datetime.now()
     with get_connection() as conn:
         cursor = conn.cursor()
-        now = datetime.now().isoformat()
         cursor.execute(
             """
             UPDATE videos
             SET status = 'published',
-                published_time = ?,
                 youtube_id = ?,
-                instagram_id = ?
+                instagram_id = ?,
+                published_at = ?,
+                publish_hour = ?,
+                publish_day = ?
             WHERE id = ?
-        """,
-            (now, youtube_id, instagram_id, video_id),
+            """,
+            (youtube_id, instagram_id, now, now.hour, now.weekday(), video_id),
         )
         conn.commit()
 
 
-def save_analytics(
-    video_id: int,
-    platform: str,
-    day_of_week: int,
-    hour: int,
-    views: int,
-    likes: int,
-    comments: int,
-    shares: int,
-    retention_rate: float,
-):
-    """Compute engagement score and record post performance."""
-    # Composite score: views (40%), retention (30%), interactions (30%)
-    interactions = likes + comments + shares
-    score = (views * 0.4) + (retention_rate * 100 * 0.3) + (interactions * 0.3)
-
+def update_video_metrics(
+    youtube_id: str, views: int, likes: int, comments: int
+) -> None:
+    """Update view/engagement metrics and compute weighted performance score."""
+    score = views + (likes * 5.0) + (comments * 10.0)
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO analytics (
-                video_id, platform, post_day_of_week, post_hour,
-                views, likes, comments, shares, retention_rate, engagement_score
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                video_id,
-                platform,
-                day_of_week,
-                hour,
-                views,
-                likes,
-                comments,
-                shares,
-                retention_rate,
-                score,
-            ),
+            UPDATE videos
+            SET view_count = ?,
+                like_count = ?,
+                comment_count = ?,
+                engagement_score = ?
+            WHERE youtube_id = ?
+            """,
+            (views, likes, comments, score, youtube_id),
         )
         conn.commit()
 
 
-def get_slot_performance_averages(platform: str) -> list:
-    """Fetch average engagement scores grouped by day of week and hour."""
+def get_published_youtube_ids() -> List[str]:
+    """Return all YouTube IDs that need metric updates."""
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT
-                post_day_of_week,
-                post_hour,
-                AVG(engagement_score) as avg_score,
-                COUNT(*) as sample_count
-            FROM analytics
-            WHERE platform = ?
-            GROUP BY post_day_of_week, post_hour
-            ORDER BY avg_score DESC
-        """,
-            (platform,),
+            SELECT youtube_id 
+            FROM videos 
+            WHERE status = 'published' AND youtube_id IS NOT NULL
+            """
         )
-        return cursor.fetchall()
-
-
-if __name__ == "__main__":
-    initialize_database()
+        rows = cursor.fetchall()
+        return [row["youtube_id"] for row in rows]
